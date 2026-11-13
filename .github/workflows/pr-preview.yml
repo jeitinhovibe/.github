@@ -278,7 +278,7 @@ jobs:
         run: >-
           npx --yes wrangler@4 d1 migrations apply
           "${{ steps.meta.outputs.db }}" --remote
-          --config wrangler.preview.json --yes
+          --config wrangler.preview.json
 
       - name: Deploy the preview Worker
         if: inputs.profile == 'isolated'
