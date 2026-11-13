@@ -1,0 +1,472 @@
+name: PR preview
+
+# Shared preview pipeline for Jeitinho Vibe Cloudflare apps.
+#
+# Two profiles, chosen by the caller:
+#
+#   stateless  Static assets on a single Worker. Uses Cloudflare Previews
+#              (`wrangler preview`): `previews_enabled` on the production
+#              custom-domain route mints the wildcard DNS record and
+#              certificate once, and every preview is one extra label.
+#
+#   isolated   Stateful apps that must not touch production data. Deploys a
+#              separate Worker per PR with its own custom domain and points its
+#              D1 binding at a shared preview database.
+#
+# Both profiles serve `pr-<number>.<production hostname>`, comment one link on
+# the PR, smoke-test it before commenting, and clean up when the PR closes.
+#
+# The caller owns the trigger and concurrency, e.g.:
+#
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review, closed]
+#   concurrency:
+#     group: preview-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     preview:
+#       uses: jeitinhovibe/.github/.github/workflows/pr-preview.yml@main
+#       with:
+#         profile: isolated
+#         preview_database: my-app-preview
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Preview mechanism: 'isolated' (separate Worker + DB) or 'stateless' (Cloudflare Previews)."
+        type: string
+        required: false
+        default: isolated
+      app:
+        description: Worker name stem. Defaults to `name` in wrangler.jsonc.
+        type: string
+        required: false
+        default: ""
+      production_hostname:
+        description: Production hostname. Defaults to the first custom-domain route in wrangler.jsonc.
+        type: string
+        required: false
+        default: ""
+      preview_database:
+        description: Shared D1 database name for isolated previews. Defaults to `<app>-preview`.
+        type: string
+        required: false
+        default: ""
+      prepare_command:
+        description: Shell command run before deploying, e.g. staging static assets.
+        type: string
+        required: false
+        default: ""
+      note:
+        description: Extra sentence for the PR comment.
+        type: string
+        required: false
+        default: ""
+      smoke_path:
+        description: Path polled until the preview answers 200.
+        type: string
+        required: false
+        default: "/"
+      node_version:
+        description: Node version for build/publish steps.
+        type: string
+        required: false
+        default: "22"
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    name: Deploy preview
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PROFILE: ${{ inputs.profile }}
+      APP_INPUT: ${{ inputs.app }}
+      HOST_INPUT: ${{ inputs.production_hostname }}
+      DB_INPUT: ${{ inputs.preview_database }}
+
+    steps:
+      - name: Validate the profile
+        run: |
+          case "$PROFILE" in
+            isolated|stateless) ;;
+            *) echo "::error::Unknown profile '$PROFILE' — use 'isolated' or 'stateless'."; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+
+      - name: Prepare the app
+        if: inputs.prepare_command != ''
+        run: ${{ inputs.prepare_command }}
+
+      - name: Resolve preview names
+        id: meta
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          // Tolerate JSONC: strip comments while respecting string literals.
+          function parseJsonc(text) {
+            let out = "";
+            let inString = false;
+            let inLine = false;
+            let inBlock = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              const next = text[i + 1];
+              if (inLine) {
+                if (c === "\n") { inLine = false; out += c; }
+                continue;
+              }
+              if (inBlock) {
+                if (c === "*" && next === "/") { inBlock = false; i++; }
+                continue;
+              }
+              if (inString) {
+                out += c;
+                if (c === "\\") { out += next ?? ""; i++; }
+                else if (c === '"') inString = false;
+                continue;
+              }
+              if (c === '"') { inString = true; out += c; continue; }
+              if (c === "/" && next === "/") { inLine = true; i++; continue; }
+              if (c === "/" && next === "*") { inBlock = true; i++; continue; }
+              out += c;
+            }
+            return JSON.parse(out);
+          }
+
+          const pr = process.env.PR_NUMBER;
+          const cfg = parseJsonc(fs.readFileSync("wrangler.jsonc", "utf8"));
+          const app = process.env.APP_INPUT || cfg.name;
+          const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
+          const prod =
+            process.env.HOST_INPUT ||
+            (routes.find((r) => r && r.custom_domain) || routes[0] || {}).pattern;
+
+          if (!app) throw new Error("No app name: set `app` input or `name` in wrangler.jsonc");
+          if (!prod) throw new Error("No production hostname: set `production_hostname` input or a route in wrangler.jsonc");
+
+          const host = `pr-${pr}.${prod}`;
+          const worker = `${app}-pr-${pr}`;
+          const db = process.env.DB_INPUT || `${app}-preview`;
+
+          const out = [
+            `app=${app}`,
+            `prod=${prod}`,
+            `host=${host}`,
+            `worker=${worker}`,
+            `db=${db}`,
+            `url=https://${host}`,
+          ].join("\n");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `${out}\n`);
+          console.log(out);
+          NODE
+
+      - name: Find or create the preview database
+        if: inputs.profile == 'isolated'
+        id: db
+        run: |
+          set -euo pipefail
+          DB_NAME="${{ steps.meta.outputs.db }}"
+          DB_ID=$(npx --yes wrangler@4 d1 list --json | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => (input += chunk));
+            process.stdin.on("end", () => {
+              const rows = JSON.parse(input);
+              const row = rows.find((item) => item.name === process.env.DB_NAME);
+              if (row) process.stdout.write(row.uuid || row.id || "");
+            });
+          ')
+          if [ -z "$DB_ID" ]; then
+            echo "Creating $DB_NAME…"
+            OUTPUT=$(npx --yes wrangler@4 d1 create "$DB_NAME")
+            echo "$OUTPUT"
+            DB_ID=$(printf '%s\n' "$OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
+          fi
+          if [ -z "$DB_ID" ]; then
+            echo "::error::Could not determine the preview database id."
+            exit 1
+          fi
+          echo "id=$DB_ID" >> "$GITHUB_OUTPUT"
+          echo "Using preview database $DB_NAME ($DB_ID)"
+
+      - name: Generate the preview config
+        if: inputs.profile == 'isolated'
+        env:
+          PREVIEW_DB_ID: ${{ steps.db.outputs.id }}
+          PREVIEW_WORKER: ${{ steps.meta.outputs.worker }}
+          PREVIEW_HOST: ${{ steps.meta.outputs.host }}
+          PREVIEW_DB_NAME: ${{ steps.meta.outputs.db }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          function parseJsonc(text) {
+            let out = "";
+            let inString = false;
+            let inLine = false;
+            let inBlock = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              const next = text[i + 1];
+              if (inLine) {
+                if (c === "\n") { inLine = false; out += c; }
+                continue;
+              }
+              if (inBlock) {
+                if (c === "*" && next === "/") { inBlock = false; i++; }
+                continue;
+              }
+              if (inString) {
+                out += c;
+                if (c === "\\") { out += next ?? ""; i++; }
+                else if (c === '"') inString = false;
+                continue;
+              }
+              if (c === '"') { inString = true; out += c; continue; }
+              if (c === "/" && next === "/") { inLine = true; i++; continue; }
+              if (c === "/" && next === "*") { inBlock = true; i++; continue; }
+              out += c;
+            }
+            return JSON.parse(out);
+          }
+
+          const cfg = parseJsonc(fs.readFileSync("wrangler.jsonc", "utf8"));
+          cfg.name = process.env.PREVIEW_WORKER;
+          cfg.workers_dev = false;
+          cfg.routes = [
+            { pattern: process.env.PREVIEW_HOST, custom_domain: true },
+          ];
+          for (const db of cfg.d1_databases ?? []) {
+            db.database_name = process.env.PREVIEW_DB_NAME;
+            db.database_id = process.env.PREVIEW_DB_ID;
+          }
+          fs.writeFileSync("wrangler.preview.json", `${JSON.stringify(cfg, null, 2)}\n`);
+          console.log(`wrote wrangler.preview.json → ${cfg.name} at ${process.env.PREVIEW_HOST}`);
+          NODE
+
+      - name: Apply migrations to the preview database
+        if: inputs.profile == 'isolated'
+        run: >-
+          npx --yes wrangler@4 d1 migrations apply
+          "${{ steps.meta.outputs.db }}" --remote
+          --config wrangler.preview.json --yes
+
+      - name: Deploy the preview Worker
+        if: inputs.profile == 'isolated'
+        id: deploy-isolated
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          wranglerVersion: "4"
+          command: deploy --config wrangler.preview.json
+
+      - name: Upload the preview version
+        if: inputs.profile == 'stateless'
+        id: deploy-stateless
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          wranglerVersion: "4"
+          command: preview --name pr-${{ github.event.pull_request.number }}
+
+      - name: Resolve the preview URL
+        id: url
+        run: |
+          set -euo pipefail
+          URL="${{ steps.deploy-stateless.outputs.preview-url }}"
+          if [ -z "$URL" ]; then
+            URL="https://${{ steps.meta.outputs.host }}"
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview URL: $URL"
+
+      - name: Wait for the preview to answer
+        run: |
+          set -euo pipefail
+          target="${{ steps.url.outputs.url }}${{ inputs.smoke_path }}"
+          code=000
+          for attempt in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$target" || true)
+            echo "attempt $attempt: GET $target -> $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "::error::$target did not return 200 (last: $code)"
+          exit 1
+
+      - name: Comment the preview link
+        uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.url.outputs.url }}
+          PREVIEW_NOTE: ${{ inputs.note }}
+          PREVIEW_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const markers = ["<!-- preview -->", "<!-- halfsies-preview -->", "<!-- pr-preview-link -->"];
+            const marker = markers[0];
+            const pr = context.payload.pull_request.number;
+            const url = process.env.PREVIEW_URL;
+            const note = process.env.PREVIEW_NOTE;
+            const sha = (process.env.PREVIEW_SHA || "").slice(0, 7);
+
+            const body = [
+              marker,
+              "### Preview",
+              `**${url}**`,
+              "",
+              note || "",
+              `Snapshot of \`${sha}\`.`,
+            ].filter((line) => line !== "").join("\n");
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: pr,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => markers.some((m) => c.body?.includes(m)));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: pr,
+                body,
+              });
+            }
+
+  cleanup:
+    name: Remove preview
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PROFILE: ${{ inputs.profile }}
+      APP_INPUT: ${{ inputs.app }}
+      HOST_INPUT: ${{ inputs.production_hostname }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Resolve preview names
+        id: meta
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          function parseJsonc(text) {
+            let out = "";
+            let inString = false;
+            let inLine = false;
+            let inBlock = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i];
+              const next = text[i + 1];
+              if (inLine) {
+                if (c === "\n") { inLine = false; out += c; }
+                continue;
+              }
+              if (inBlock) {
+                if (c === "*" && next === "/") { inBlock = false; i++; }
+                continue;
+              }
+              if (inString) {
+                out += c;
+                if (c === "\\") { out += next ?? ""; i++; }
+                else if (c === '"') inString = false;
+                continue;
+              }
+              if (c === '"') { inString = true; out += c; continue; }
+              if (c === "/" && next === "/") { inLine = true; i++; continue; }
+              if (c === "/" && next === "*") { inBlock = true; i++; continue; }
+              out += c;
+            }
+            return JSON.parse(out);
+          }
+
+          const pr = process.env.PR_NUMBER;
+          const cfg = parseJsonc(fs.readFileSync("wrangler.jsonc", "utf8"));
+          const app = process.env.APP_INPUT || cfg.name;
+          const worker = `${app}-pr-${pr}`;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `worker=${worker}\n`);
+          console.log(`preview worker: ${worker}`);
+          NODE
+
+      - name: Delete the preview Worker
+        if: inputs.profile == 'isolated'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          wranglerVersion: "4"
+          command: delete ${{ steps.meta.outputs.worker }} --force
+        continue-on-error: true
+
+      - name: Delete the preview version
+        if: inputs.profile == 'stateless'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          wranglerVersion: "4"
+          command: preview delete --name pr-${{ github.event.pull_request.number }}
+        continue-on-error: true
+
+      - name: Mark the preview as removed
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const markers = ["<!-- preview -->", "<!-- halfsies-preview -->", "<!-- pr-preview-link -->"];
+            const pr = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: pr,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => markers.some((m) => c.body?.includes(m)));
+            if (!existing) return;
+            await github.rest.issues.updateComment({
+              ...context.repo,
+              comment_id: existing.id,
+              body: "<!-- preview -->\n### Preview\n_Preview removed — this pull request is closed._",
+            });
