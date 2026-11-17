@@ -313,11 +313,24 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ steps.url.outputs.url }}${{ inputs.smoke_path }}"
+          # Cloudflare's bot protection answers a bare `curl` user-agent from a
+          # datacentre IP with a managed challenge (403, `cf-mitigated:
+          # challenge`, "Just a moment…") — which says nothing about whether the
+          # deploy landed. Send a browser-shaped request so this measures the
+          # preview, not the WAF.
+          ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
           code=000
           for attempt in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$target" || true)
+            code=$(curl -s -o /dev/null -D /tmp/preview-headers -w '%{http_code}' --max-time 15 \
+              -A "$ua" \
+              -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+              -H 'Accept-Language: en-US,en;q=0.9' \
+              "$target" || true)
             echo "attempt $attempt: GET $target -> $code"
             if [ "$code" = "200" ]; then exit 0; fi
+            if grep -qi '^cf-mitigated: challenge' /tmp/preview-headers 2>/dev/null; then
+              echo "::warning::Cloudflare challenged the runner itself ($target -> $code); the deploy may still be fine."
+            fi
             sleep 5
           done
           echo "::error::$target did not return 200 (last: $code)"
